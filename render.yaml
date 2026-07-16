@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: alm-mcp-server
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python server.py"
+    envVars:
+      - key: ALM_BASE_URL
+        value: https://learningmanager.adobe.com
+      - key: ALM_ACCESS_TOKEN
+        sync: false
