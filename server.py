@@ -69,7 +69,8 @@ REQUEST_TIMEOUT = 30.0
 
 JSON_API_CONTENT_TYPE = "application/vnd.api+json;charset=UTF-8"
 
-mcp = FastMCP("adobe_learning_manager")
+_port = int(os.environ.get("PORT", 8000))
+mcp = FastMCP("adobe_learning_manager", host="0.0.0.0", port=_port)
 
 
 def _headers() -> dict:
@@ -498,7 +499,7 @@ async def get_job_status(job_id: str) -> Any:
 if __name__ == "__main__":
     # Remote hosting (e.g. Render) requires Streamable HTTP, not stdio —
     # stdio only works when the client launches this as a local subprocess.
-    # Render sets $PORT; default to 8000 for local testing.
-    import os as _os
-    port = int(_os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    # host/port are set on the FastMCP constructor above (official mcp SDK
+    # reads them from there, NOT from run() — unlike the third-party
+    # `fastmcp` package, which does accept host/port on run()).
+    mcp.run(transport="streamable-http")
