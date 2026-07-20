@@ -401,6 +401,44 @@ async def list_catalogs(ctx: Context, page_limit: int = 20) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def list_skills(ctx: Context, page_limit: int = 20) -> Any:
+    """
+    List the skills tracked in this ALM account (the skills taxonomy itself,
+    not a specific learner's earned skills). Each skill has levels, and each
+    level maps to courses that build toward it.
+
+    Args:
+        page_limit: Max results to return.
+    """
+    try:
+        return await _request(ctx, "GET", "/skills", params={"page[limit]": page_limit})
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_skill(skill_id: str, ctx: Context, include: Optional[str] = None) -> Any:
+    """
+    Get details for a single skill, including its levels and (optionally)
+    the courses/badges tied to each level.
+
+    Args:
+        skill_id: The ALM skill ID.
+        include: Optional related data, e.g. "levels" to get skill levels,
+            or "skillLevel.badge" for the badge tied to each level.
+    """
+    params = {"include": include} if include else None
+    try:
+        return await _request(ctx, "GET", f"/skills/{skill_id}", params=params)
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Enrollments
 # ---------------------------------------------------------------------------
 
@@ -499,6 +537,29 @@ async def unenroll_user(user_id: str, enrollment_id: str, ctx: Context) -> Any:
     """
     try:
         return await _request(ctx, "DELETE", f"/users/{user_id}/enrollments/{enrollment_id}")
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_resource_grade(grade_id: str, ctx: Context) -> Any:
+    """
+    Get module/resource-level progress detail: time spent, percent progress,
+    pass/fail status, and quiz score for one resource within a learning
+    object the learner is enrolled in.
+
+    This is more granular than get_enrollment's overall progress percent —
+    use it when you need per-module detail rather than the whole course's
+    status. Find the grade_id via get_enrollment(..., include="loResourceGrades")
+    or get_learning_object(..., include="instances.loResources.resources"),
+    then look for the matching learningObjectResourceGrade relationship ID.
+
+    Args:
+        grade_id: The loResourceGrade ID (e.g. from an enrollment's
+            loResourceGrades relationship).
+    """
+    try:
+        return await _request(ctx, "GET", f"/loResourceGrades/{grade_id}")
     except RuntimeError as e:
         return {"error": str(e)}
 
