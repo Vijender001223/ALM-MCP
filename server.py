@@ -55,7 +55,8 @@ WHAT THIS COVERS
 Users:
   - list_users, get_user, create_user, update_user, delete_user, list_user_groups
 Learning objects:
-  - list_learning_objects, get_learning_object, list_catalogs
+  - list_learning_objects, get_learning_object, list_catalogs,
+    search_learning_objects
 Enrollments:
   - list_enrollments, enroll_user, get_enrollment, unenroll_user
 Badges:
@@ -382,6 +383,66 @@ async def get_learning_object(lo_id: str, ctx: Context, include: Optional[str] =
     params = {"include": include} if include else None
     try:
         return await _request(ctx, "GET", f"/learningObjects/{lo_id}", params=params)
+    except RuntimeError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def search_learning_objects(
+    query: str,
+    ctx: Context,
+    lo_types: Optional[str] = None,
+    page_limit: int = 20,
+    page_cursor: Optional[str] = None,
+) -> Any:
+    """
+    Full-text search across learning objects (courses, learning programs,
+    certifications, job aids) by title/description, via ALM's dedicated
+    search endpoint (POST /search/query).
+
+    Unlike list_learning_objects — which has no free-text filter and
+    forces the caller to walk every page and match a keyword client-side —
+    this hits ALM's server-side search index directly. Use this whenever
+    you have a keyword or title fragment to match (e.g. "find courses
+    with 'test' in the title"); reserve list_learning_objects for
+    unfiltered browsing or exact lo_types-only listing.
+
+    NOTE: ALM's exact /search/query request schema isn't fully documented
+    inline here — the payload below follows the same JSON:API "data.type"
+    + "data.attributes" convention used by this server's other POST
+    endpoints (create_user, create_job). Verify field names against
+    https://learningmanager.adobe.com/docs/primeapi/v2/#!/misc/post_search_query
+    against your account's API version and adjust the payload/params
+    below if ALM expects different keys (e.g. "queryString" instead of
+    "query", or a top-level "query" param instead of a request body).
+
+    Args:
+        query: Free-text search string, matched against learning object
+            title/description server-side.
+        lo_types: Optional comma-separated filter, e.g. "course,jobAid".
+        page_limit: Max results to return per page (ALM max: 100).
+        page_cursor: Cursor value from a previous response's links.next
+            URL, used to fetch the next page. Omit for the first page.
+    """
+    payload = {
+        "data": {
+            "type": "search",
+            "attributes": {
+                "query": query,
+            },
+        }
+    }
+    if lo_types:
+        payload["data"]["attributes"]["loTypes"] = lo_types
+
+    params = {"page[limit]": page_limit}
+    if page_cursor:
+        params["page[cursor]"] = page_cursor
+
+    try:
+        return await _request(
+            ctx, "POST", "/search/query", params=params, json_body=payload
+        )
     except RuntimeError as e:
         return {"error": str(e)}
 
