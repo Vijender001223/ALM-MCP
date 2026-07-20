@@ -282,9 +282,23 @@ async def list_users(
     (increase page_limit up to ALM's max of 100, and walk pages if
     needed) and match the name client-side instead.
 
+    PAGINATION: this tool paginates with page_offset/page_limit ONLY.
+    There is no page_cursor parameter, even though ALM's raw REST API
+    supports cursor-based pagination in other contexts and the API docs
+    UI may display a page[cursor] field. Do not pass a cursor value
+    here — it will be silently ignored, which looks exactly like a
+    stuck/broken pagination cursor (every "next page" call appears to
+    return page 1 again) but is actually just an unused argument. To
+    get subsequent pages, increment page_offset by page_limit on each
+    call (e.g. 0, 100, 200, ...) and stop once the returned data array
+    is shorter than page_limit or the response's links object has no
+    "next" key.
+
     Args:
         page_limit: Max number of users to return per page.
-        page_offset: Offset for pagination.
+        page_offset: Offset for pagination. Increment by page_limit on
+            each subsequent call to walk through all pages — this is
+            the only pagination mechanism this tool supports.
         filter_field: Field to filter on, e.g. "email" or "ids". Must
             be paired with filter_value. Omit both for an unfiltered list.
         filter_value: Exact value to match for filter_field, e.g. a
