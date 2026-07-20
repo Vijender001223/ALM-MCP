@@ -109,6 +109,22 @@ mcp = FastMCP("adobe_learning_manager", host="0.0.0.0", port=_port)
 # connected client's session and unique among concurrently-live sessions.
 _session_tokens: dict[int, str] = {}
 
+# Separate per-session store for LEARNER-scoped tokens. ALM's
+# /search/query endpoint requires a learner-role token — the admin
+# token above (used by every other tool) will 401/403 against it, since
+# admin and learner scopes are separate ALM API permissions, not a
+# superset relationship. Kept as an entirely independent dict (not
+# reusing _session_tokens) so that setting one never affects the other:
+# a person can use search_learning_objects and enroll_user in the same
+# session without either token clobbering the other.
+_session_learner_tokens: dict[int, str] = {}
+
+# Fallback default for the learner token, same pattern as
+# DEFAULT_ACCESS_TOKEN above — fine for solo testing, but each real user
+# should set their own via set_learner_access_token once multiple people
+# share this deployment.
+DEFAULT_LEARNER_ACCESS_TOKEN = os.environ.get("ALM_LEARNER_ACCESS_TOKEN")
+
 
 def _session_key(ctx: Context) -> int:
     return id(ctx.request_context.session)
@@ -116,6 +132,10 @@ def _session_key(ctx: Context) -> int:
 
 def _get_token(ctx: Context) -> Optional[str]:
     return _session_tokens.get(_session_key(ctx), DEFAULT_ACCESS_TOKEN)
+
+
+def _get_learner_token(ctx: Context) -> Optional[str]:
+    return _session_learner_tokens.get(_session_key(ctx), DEFAULT_LEARNER_ACCESS_TOKEN)
 
 
 def _headers(token: Optional[str]) -> dict:
@@ -129,9 +149,10 @@ def _headers(token: Optional[str]) -> dict:
 @mcp.tool()
 async def set_access_token(new_token: str, ctx: Context) -> Any:
     """
-    Set YOUR OWN ALM OAuth access token for this session, without
-    restarting the server. Call this once before using any other tool —
-    every subsequent tool call you make will use this token.
+    Set YOUR OWN ALM admin-scoped OAuth access token for this session,
+    without restarting the server. Call this once before using any other
+    tool EXCEPT search_learning_objects — every subsequent admin tool
+    call you make will use this token.
 
     This is per-session: your token is isolated from any other person
     connected to this same server at the same time. Setting your token
@@ -141,6 +162,11 @@ async def set_access_token(new_token: str, ctx: Context) -> Any:
     Use this when you first connect, or again later if you hit a 401
     "Token expired" error and have regenerated a fresh token.
 
+    Note: search_learning_objects needs a DIFFERENT, learner-scoped
+    token — see set_learner_access_token. This token and that one are
+    stored completely independently; setting one never touches the
+    other, so you can use both in the same session.
+
     Args:
         new_token: Your OAuth access token string (just the raw token —
             do not include the "oauth " prefix).
@@ -148,7 +174,34 @@ async def set_access_token(new_token: str, ctx: Context) -> Any:
     _session_tokens[_session_key(ctx)] = new_token.strip()
     return {
         "status": "updated",
-        "note": "Your token is now active for this session only. Other users of this server are unaffected, and you are unaffected by them.",
+        "note": "Your admin token is now active for this session only. Other users of this server are unaffected, and you are unaffected by them. Note: search_learning_objects still needs its own learner-scoped token via set_learner_access_token.",
+    }
+
+
+@mcp.tool()
+async def set_learner_access_token(new_token: str, ctx: Context) -> Any:
+    """
+    Set YOUR OWN LEARNER-scoped OAuth access token for this session,
+    used specifically by search_learning_objects. ALM's /search/query
+    endpoint requires a learner-role token — your admin token from
+    set_access_token will fail against it (401/403), since admin and
+    learner scopes are separate ALM API permissions, not a superset
+    relationship. Every other tool here still uses your admin token;
+    only search_learning_objects reads this one.
+
+    This is per-session and fully independent from your admin token:
+    setting this does not affect set_access_token's token, and vice
+    versa, and neither is visible to other people connected to this
+    same server.
+
+    Args:
+        new_token: Your learner-scoped OAuth access token (raw token,
+            no "oauth " prefix).
+    """
+    _session_learner_tokens[_session_key(ctx)] = new_token.strip()
+    return {
+        "status": "updated",
+        "note": "Your learner token is now active for search_learning_objects in this session only. This is separate from your admin token (set_access_token) — neither affects the other, and other users are unaffected either way.",
     }
 
 
@@ -162,13 +215,25 @@ async def _request(
     path: str,
     params: Optional[dict] = None,
     json_body: Optional[dict] = None,
+    use_learner_token: bool = False,
 ) -> Any:
-    token = _get_token(ctx)
-    if not token:
-        raise RuntimeError(
-            "No ALM access token set for this session. Call set_access_token "
-            "with your own ALM OAuth token first."
-        )
+    if use_learner_token:
+        token = _get_learner_token(ctx)
+        if not token:
+            raise RuntimeError(
+                "No learner-scoped access token set for this session. ALM's "
+                "/search/query endpoint requires a LEARNER-role token, "
+                "different from the admin token used by other tools. Call "
+                "set_learner_access_token with your own learner-scoped "
+                "OAuth token first."
+            )
+    else:
+        token = _get_token(ctx)
+        if not token:
+            raise RuntimeError(
+                "No ALM access token set for this session. Call set_access_token "
+                "with your own ALM OAuth token first."
+            )
 
     url = f"{BASE_URL.rstrip('/')}{API_ROOT}{path}"
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
@@ -407,6 +472,13 @@ async def search_learning_objects(
     with 'test' in the title"); reserve list_learning_objects for
     unfiltered browsing or exact lo_types-only listing.
 
+    IMPORTANT — SEPARATE TOKEN REQUIRED: this endpoint is scoped to a
+    LEARNER-role token, not the admin token from set_access_token that
+    every other tool here uses. Call set_learner_access_token with a
+    learner-scoped token for THIS session before using this tool for the
+    first time — your admin token will fail here (401/403) even though
+    it works fine for enroll_user, list_users, etc.
+
     NOTE: ALM's exact /search/query request schema isn't fully documented
     inline here — the payload below follows the same JSON:API "data.type"
     + "data.attributes" convention used by this server's other POST
@@ -441,7 +513,12 @@ async def search_learning_objects(
 
     try:
         return await _request(
-            ctx, "POST", "/search/query", params=params, json_body=payload
+            ctx,
+            "POST",
+            "/search/query",
+            params=params,
+            json_body=payload,
+            use_learner_token=True,
         )
     except RuntimeError as e:
         return {"error": str(e)}
