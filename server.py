@@ -2037,4 +2037,16 @@ async def get_job_status(ctx: Context, job_id: str) -> Any:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport=MCP_TRANSPORT)
+    print(
+        f"Starting MCP server: transport={MCP_TRANSPORT}, host={MCP_HOST}, port={MCP_PORT}",
+        flush=True,
+    )
+    try:
+        mcp.run(transport=MCP_TRANSPORT)
+    except Exception:
+        import traceback
+        print("FATAL: server crashed on startup or during run:", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        raise
