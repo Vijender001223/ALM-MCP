@@ -601,6 +601,194 @@ def _decode_id_token_email(id_token: str) -> dict:
 
 
 @mcp.tool()
+async def _resolve_email_from_tokens(tokens: dict) -> tuple[Optional[str], bool, Optional[str], Optional[dict]]:
+    """
+    Shared by both the local (loopback) and remote (server-side callback
+    route) OAuth flows: given a token response from Adobe IMS, resolves
+    an email via id_token claims -> /ims/userinfo fallback ->
+    known_identities.json sub-mapping fallback, in that order.
+
+    Returns (email, email_verified, sub, error_dict_or_None). If email
+    resolution fails entirely, email is None and error_dict explains why
+    (including the verified `sub`, so the person can still add themselves
+    to known_identities.json and retry).
+    """
+    id_token = tokens.get("id_token")
+    if not id_token:
+        return None, False, None, {
+            "error": "No id_token in Adobe's response — check that scope includes 'openid'."
+        }
+
+    claims = _decode_id_token_email(id_token)
+    sub = claims.get("sub")
+    email = claims.get("email")
+    email_verified = claims.get("email_verified", False)
+
+    if not email:
+        access_token = tokens.get("access_token")
+        if access_token:
+            async with httpx.AsyncClient() as client:
+                userinfo_resp = await client.get(
+                    f"https://{IMS_AUTH_HOST}/ims/userinfo/v2",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            if userinfo_resp.status_code == 200:
+                userinfo = userinfo_resp.json()
+                email = userinfo.get("email")
+                email_verified = userinfo.get("email_verified", email_verified)
+
+    if not email and sub:
+        known = _load_known_identities()
+        entry = known.get(sub)
+        if entry and entry.get("email"):
+            email = entry["email"]
+            email_verified = True
+
+    if not email:
+        return None, False, sub, {
+            "error": (
+                "Signed in with Adobe (verified), but no email is available "
+                "yet for this identity. This credential's scopes only expose "
+                f"a 'sub' claim, not email directly. Your verified sub is:\n\n"
+                f"    {sub}\n\n"
+                f"To finish setup, add this line to {KNOWN_IDENTITIES_PATH} "
+                "(create the file if it doesn't exist yet), editing it "
+                "directly in a text editor — NOT through any tool call:\n\n"
+                f'    {{"{sub}": {{"email": "your-email@company.com"}}}}\n\n'
+                "Then try signing in again."
+            ),
+            "sub": sub,
+        }
+
+    return email, email_verified, sub, None
+
+
+# ---------------------------------------------------------------------------
+# Remote OAuth callback support
+# ---------------------------------------------------------------------------
+# login_with_adobe()'s local flow (browser + loopback listener) fundamentally
+# can't work when this process is deployed remotely — see that tool's
+# docstring. This section adds the actual fix: a real server-side OAuth
+# callback ROUTE on the deployed URL, which Adobe can redirect to over the
+# public internet, instead of localhost.
+#
+# Key design point: the browser making this callback request has no MCP
+# session context (it's a plain HTTP GET, not an MCP JSON-RPC call), so we
+# can't use ctx.request_context.session here. Instead, login_with_adobe()
+# stashes the calling session's id in _pending_logins keyed by OAuth
+# `state` BEFORE redirecting the person to Adobe; this callback route
+# looks up that same state to know which session's identity to update.
+#
+# MCP_PUBLIC_URL must be set to this service's real public URL (e.g.
+# https://alm-mcp.onrender.com) — used to build the redirect_uri. That
+# same value + "/oauth/callback" must ALSO be added as an additional
+# registered redirect URI on the ALM_IMS_CLIENT_ID credential in Adobe
+# Developer Console (it currently only has the localhost one) — this is a
+# one-time manual step, not something this code can do for you.
+MCP_PUBLIC_URL = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
+REMOTE_OAUTH_REDIRECT_URI = f"{MCP_PUBLIC_URL}/oauth/callback" if MCP_PUBLIC_URL else None
+
+# {state: {"session_id": int, "code_verifier": str, "created_at": float}}
+# Entries expire after 10 minutes (see cleanup in the callback route) so
+# this doesn't grow unbounded from abandoned login attempts.
+_pending_logins: dict = {}
+
+
+try:
+    from starlette.requests import Request as _StarletteRequest
+    from starlette.responses import HTMLResponse as _StarletteHTMLResponse
+    _STARLETTE_AVAILABLE = True
+except ImportError:
+    _STARLETTE_AVAILABLE = False
+
+
+if _STARLETTE_AVAILABLE:
+    # UNVERIFIED AGAINST YOUR EXACT INSTALLED SDK VERSION: @mcp.custom_route
+    # is the documented FastMCP pattern for adding a plain HTTP route
+    # (health checks, webhooks, OAuth callbacks) alongside the MCP
+    # protocol's own endpoint, on the same Starlette app — but this
+    # couldn't be tested against a real server in this environment (no
+    # network access to actually run one). If this decorator doesn't
+    # exist on your installed `mcp` version, check that package's docs
+    # for whatever the current equivalent is (some versions may expose
+    # the underlying Starlette app directly instead, e.g. via
+    # mcp.streamable_http_app() or similar, for you to add a route to
+    # by hand).
+    @mcp.custom_route("/oauth/callback", methods=["GET"])
+    async def oauth_callback_route(request: "_StarletteRequest") -> "_StarletteHTMLResponse":
+        """
+        Real server-side OAuth callback for the remote deployment.
+        Adobe redirects here after sign-in; this exchanges the code for
+        tokens, resolves an email (same cascade as the local flow), and
+        writes the result into whichever session initiated the login
+        (looked up via the `state` param, stashed by login_with_adobe()).
+        """
+        params = dict(request.query_params)
+        state = params.get("state")
+        code = params.get("code")
+
+        def _html(message: str) -> "_StarletteHTMLResponse":
+            return _StarletteHTMLResponse(f"<html><body><h3>{message}</h3></body></html>")
+
+        if "error" in params:
+            return _html(
+                f"Adobe sign-in failed: {params.get('error_description', params['error'])}"
+            )
+        if not state or state not in _pending_logins:
+            return _html(
+                "This sign-in link has expired or was already used. "
+                "Go back to your chat and call login_with_adobe() again."
+            )
+
+        pending = _pending_logins.pop(state)
+        if time.time() - pending["created_at"] > 600:
+            return _html("This sign-in link expired (10 minute limit). Call login_with_adobe() again.")
+        if not code:
+            return _html("No authorization code received from Adobe.")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{IMS_AUTH_HOST}/ims/token/v3",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": IMS_CLIENT_ID,
+                    "client_secret": IMS_CLIENT_SECRET,
+                    "redirect_uri": REMOTE_OAUTH_REDIRECT_URI,
+                    "code_verifier": pending["code_verifier"],
+                },
+            )
+        if resp.status_code != 200:
+            return _html(f"Token exchange with Adobe IMS failed: {resp.text[:300]}")
+
+        email, email_verified, sub, error = await _resolve_email_from_tokens(resp.json())
+        if error:
+            return _html(error["error"].replace("\n", "<br>"))
+
+        session_id = pending["session_id"]
+        if session_id not in _session_state:
+            # Session's first-ever state access is normally lazy via
+            # _get_session_state(ctx) — but we only have a raw session_id
+            # here, not a ctx, so replicate that default shape directly.
+            _session_state[session_id] = {
+                "active_environment": _default_environment_name,
+                "identity": {"email": None, "email_verified": None, "verified_at": 0, "sub": None},
+                "access_token_overrides": {},
+                "learner_access_token": os.environ.get("ALM_LEARNER_ACCESS_TOKEN"),
+                "token_caches": {
+                    name: {"access_token": None, "expires_at": 0.0} for name in ALM_ENVIRONMENTS
+                },
+            }
+        identity = _session_state[session_id]["identity"]
+        identity["sub"] = sub
+        identity["email"] = email
+        identity["email_verified"] = email_verified
+        identity["verified_at"] = time.time()
+
+        return _html(f"Signed in as {email}. You can close this tab and return to Claude, then call whoami().")
+
+
+@mcp.tool()
 async def login_with_adobe(ctx: Context) -> Any:
     """
     Opens your system browser to Adobe's real sign-in screen (IMS) and
@@ -617,34 +805,19 @@ async def login_with_adobe(ctx: Context) -> Any:
     (see ALM_IMS_REDIRECT_PORT).
 
     Blocks for up to ~2 minutes waiting for sign-in to complete in the
-    browser tab it opens. Call whoami() afterward to see the resolved
-    ALM role for the verified email.
+    browser tab it opens (LOCAL/stdio mode only). When deployed remotely
+    (MCP_TRANSPORT=streamable-http), this instead returns a link to open
+    yourself — it can't block waiting, since there's no per-call listener
+    the way local mode has; call whoami() afterward to check whether
+    sign-in completed.
 
-    LOCAL (stdio) ONLY — NOT SUPPORTED WHEN DEPLOYED REMOTELY. This
-    opens a browser and listens on localhost on whatever machine THIS
-    PROCESS is running on. For a local stdio server that's your own
-    machine, so it works. For a remote deployment (MCP_TRANSPORT=
-    streamable-http), this process runs on a server, not on the caller's
-    machine — webbrowser.open() would try to open a browser that doesn't
-    exist there, and the loopback listener would be unreachable by the
-    actual caller's browser regardless. Rather than fail confusingly
-    partway through, this returns a clear error immediately if called
-    while running remotely. A real fix would need a proper server-side
-    OAuth callback route (a public HTTPS redirect_uri on the deployed
-    URL, not localhost) — not yet built.
+    Requires MCP_PUBLIC_URL to be set (to this service's real public URL,
+    e.g. https://alm-mcp.onrender.com) when running remotely, and that
+    same URL + "/oauth/callback" must be added as an additional
+    registered redirect URI on the ALM_IMS_CLIENT_ID credential in Adobe
+    Developer Console — a one-time manual step, separate from the
+    localhost one already registered for local use.
     """
-    if MCP_TRANSPORT != "stdio":
-        return {
-            "error": (
-                "login_with_adobe() only works when this server runs locally "
-                "over stdio — it opens a browser and listens on localhost on "
-                "whichever machine this process is running on, which is this "
-                "remote server, not your machine. Use set_my_identity() "
-                "instead for read-only role checks, or run this server "
-                "locally if you need IMS-verified write access."
-            )
-        }
-
     if not IMS_CLIENT_ID or not IMS_CLIENT_SECRET:
         return {
             "error": (
@@ -655,6 +828,21 @@ async def login_with_adobe(ctx: Context) -> Any:
                 "for ALM_ACCESS_TOKEN."
             )
         }
+
+    is_remote = MCP_TRANSPORT != "stdio"
+    if is_remote and not REMOTE_OAUTH_REDIRECT_URI:
+        return {
+            "error": (
+                "Running remotely, but MCP_PUBLIC_URL isn't set — can't build a "
+                "valid OAuth redirect_uri. Set MCP_PUBLIC_URL to this service's "
+                "real public URL (e.g. https://alm-mcp.onrender.com) and make "
+                "sure that URL + '/oauth/callback' is registered as an "
+                "additional redirect URI on the IMS credential in Adobe "
+                "Developer Console."
+            )
+        }
+
+    redirect_uri = REMOTE_OAUTH_REDIRECT_URI if is_remote else IMS_REDIRECT_URI
 
     # PKCE (recommended even for confidential clients, required-in-spirit
     # for anything running on a user's own machine rather than a locked-down
@@ -667,7 +855,7 @@ async def login_with_adobe(ctx: Context) -> Any:
 
     authorize_url = f"https://{IMS_AUTH_HOST}/ims/authorize?" + urllib.parse.urlencode({
         "client_id": IMS_CLIENT_ID,
-        "redirect_uri": IMS_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         # "email" and "profile" are NOT available scopes on this
         # credential (registered under AEM Assets Author API's User
         # Authentication — its scope list is fixed to openid, AdobeID,
@@ -675,7 +863,7 @@ async def login_with_adobe(ctx: Context) -> Any:
         # Console's "Available Scopes" screen). Requesting scopes that
         # aren't registered risks rejection, so we only request what's
         # actually available. This means the id_token may not carry an
-        # email claim — see the /ims/userinfo fallback below.
+        # email claim — see _resolve_email_from_tokens's userinfo fallback.
         "scope": "openid,AdobeID",
         "response_type": "code",
         "state": state,
@@ -683,12 +871,28 @@ async def login_with_adobe(ctx: Context) -> Any:
         "code_challenge_method": "S256",
     })
 
-    # Fail fast, BEFORE opening the browser: if the cert can't be
-    # generated (e.g. `cryptography` isn't installed), we'd otherwise
-    # open the browser, send the person through the full multi-second
-    # SSO chain, and only THEN discover the listener never started —
-    # which looks exactly like a random ERR_CONNECTION_REFUSED with no
-    # clue why. Better to check first.
+    if is_remote:
+        # Stash this session's id under `state` so the callback route
+        # (a plain HTTP request with no MCP session context of its own)
+        # knows whose identity to update once Adobe redirects back.
+        _pending_logins[state] = {
+            "session_id": id(ctx.request_context.session),
+            "code_verifier": code_verifier,
+            "created_at": time.time(),
+        }
+        return {
+            "status": "action_required",
+            "authorize_url": authorize_url,
+            "instructions": (
+                "Open this URL in your own browser and sign in with Adobe. "
+                "After it completes, call whoami() to confirm — this tool "
+                "can't block and wait the way it does locally, since sign-in "
+                "happens in your browser, not this server's."
+            ),
+        }
+
+    # Local (stdio) flow: open the browser ourselves and block waiting on
+    # our own loopback listener, same as before.
     try:
         _get_or_create_local_cert()
     except RuntimeError as e:
@@ -728,69 +932,16 @@ async def login_with_adobe(ctx: Context) -> Any:
                 "code": code,
                 "client_id": IMS_CLIENT_ID,
                 "client_secret": IMS_CLIENT_SECRET,
-                "redirect_uri": IMS_REDIRECT_URI,
+                "redirect_uri": redirect_uri,
                 "code_verifier": code_verifier,
             },
         )
     if resp.status_code != 200:
         return {"error": f"Token exchange with Adobe IMS failed: {resp.text[:500]}"}
 
-    tokens = resp.json()
-    id_token = tokens.get("id_token")
-    if not id_token:
-        return {"error": "No id_token in Adobe's response — check that scope includes 'openid'."}
-
-    claims = _decode_id_token_email(id_token)
-    sub = claims.get("sub")
-    email = claims.get("email")
-    email_verified = claims.get("email_verified", False)
-
-    if not email:
-        # Expected on this credential — "email" isn't in its registered
-        # scope list (only openid, AdobeID, aem.assets.author,
-        # aem.folders). Try IMS's userinfo endpoint with the access token
-        # as a fallback before giving up.
-        access_token = tokens.get("access_token")
-        userinfo = None
-        if access_token:
-            async with httpx.AsyncClient() as client:
-                userinfo_resp = await client.get(
-                    f"https://{IMS_AUTH_HOST}/ims/userinfo/v2",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-            if userinfo_resp.status_code == 200:
-                userinfo = userinfo_resp.json()
-                email = userinfo.get("email")
-                email_verified = userinfo.get("email_verified", email_verified)
-
-    if not email and sub:
-        # Final fallback: confirmed empirically that this credential's
-        # scopes (openid, AdobeID) expose ONLY `sub` — no email, no name,
-        # nothing else, from either the id_token or /ims/userinfo. `sub`
-        # is still a real, verified, unforgeable identity claim though —
-        # look it up in the manually-maintained known_identities.json
-        # (see _load_known_identities docstring) to resolve an email.
-        known = _load_known_identities()
-        entry = known.get(sub)
-        if entry and entry.get("email"):
-            email = entry["email"]
-            email_verified = True  # verified via real IMS sub match, not self-reported
-
-    if not email:
-        return {
-            "error": (
-                "Signed in with Adobe (verified), but no email is available "
-                "yet for this identity. This credential's scopes only expose "
-                f"a 'sub' claim, not email directly. Your verified sub is:\n\n"
-                f"    {sub}\n\n"
-                f"To finish setup, add this line to {KNOWN_IDENTITIES_PATH} "
-                "(create the file if it doesn't exist yet), editing it "
-                "directly in a text editor — NOT through any tool call:\n\n"
-                f'    {{"{sub}": {{"email": "your-email@company.com"}}}}\n\n'
-                "Then call login_with_adobe() again."
-            ),
-            "sub": sub,
-        }
+    email, email_verified, sub, error = await _resolve_email_from_tokens(resp.json())
+    if error:
+        return error
 
     identity = _get_session_state(ctx)["identity"]
     identity["sub"] = sub
