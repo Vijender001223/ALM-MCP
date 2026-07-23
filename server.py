@@ -407,16 +407,50 @@ KNOWN_IDENTITIES_PATH = os.path.join(
 
 def _load_known_identities() -> dict:
     """
-    Loads {sub: {"email": "...", ...}} mappings from KNOWN_IDENTITIES_PATH.
-    Returns {} if the file doesn't exist yet — that's expected before the
-    first person has been manually registered.
+    Loads {sub: {"email": "...", ...}} mappings, checking two sources:
+
+    1. KNOWN_IDENTITIES_JSON env var — a JSON object as a single string
+       value, set directly in your hosting platform's dashboard (e.g.
+       Render's Environment tab). USE THIS FOR REMOTE DEPLOYMENTS — a
+       deployed server's filesystem is typically ephemeral (wiped on
+       every redeploy), so there's no persistent file to edit the way
+       there is locally. Unlike the ALM_ENVIRONMENTS_JSON case earlier,
+       this doesn't go through a second layer of JSON-config-file
+       escaping (Claude Desktop's config), so a plain single-line JSON
+       string works fine directly in a platform's env var UI.
+
+    2. KNOWN_IDENTITIES_PATH file — a plain file next to server.py you
+       edit directly in a text editor. Use this for LOCAL use only.
+
+    If both are set, the env var takes precedence. Returns {} if
+    neither is configured — expected before anyone's been registered.
 
     TO ADD YOURSELF: after calling login_with_adobe() once, it will show
-    your `sub` value in the error/result. Create/edit
-    known_identities.json next to this file with:
-        {"<your sub value>": {"email": "you@company.com"}}
-    directly in a text editor — NOT via any MCP tool call.
+    your `sub` value in the error/result. Then either:
+    - Remote: add {"<your sub>": {"email": "you@company.com"}} as the
+      value of KNOWN_IDENTITIES_JSON in your platform's dashboard, and
+      redeploy/restart for the new env var to take effect.
+    - Local: create/edit known_identities.json next to this file with
+      the same content, directly in a text editor — NOT via any tool call.
+
+    SECURITY NOTE UNCHANGED FROM THE FILE-BASED VERSION: whichever source
+    you use, it must only ever be edited by a human directly (dashboard
+    or text editor), never through a tool call — that's what makes a
+    sub-to-email mapping here as trustworthy as a real "email" OAuth
+    scope would have been, even though this credential's scopes don't
+    expose email directly.
     """
+    env_value = os.environ.get("KNOWN_IDENTITIES_JSON")
+    if env_value:
+        try:
+            return json.loads(env_value)
+        except json.JSONDecodeError:
+            print(
+                "WARNING: KNOWN_IDENTITIES_JSON is set but isn't valid JSON — "
+                "falling back to the file, if any.",
+                file=sys.stderr,
+            )
+
     if not os.path.exists(KNOWN_IDENTITIES_PATH):
         return {}
     try:
@@ -651,10 +685,15 @@ async def _resolve_email_from_tokens(tokens: dict) -> tuple[Optional[str], bool,
                 "yet for this identity. This credential's scopes only expose "
                 f"a 'sub' claim, not email directly. Your verified sub is:\n\n"
                 f"    {sub}\n\n"
-                f"To finish setup, add this line to {KNOWN_IDENTITIES_PATH} "
-                "(create the file if it doesn't exist yet), editing it "
-                "directly in a text editor — NOT through any tool call:\n\n"
+                "To finish setup, add this mapping using WHICHEVER of these "
+                "matches your deployment:\n\n"
+                "  REMOTE (e.g. Render): add/update the KNOWN_IDENTITIES_JSON "
+                "environment variable in your platform's dashboard, then "
+                "redeploy/restart. Value should be (or include) this entry:\n"
                 f'    {{"{sub}": {{"email": "your-email@company.com"}}}}\n\n'
+                f"  LOCAL: create/edit {KNOWN_IDENTITIES_PATH} directly in a "
+                "text editor (NOT through any tool call) with the same "
+                "content.\n\n"
                 "Then try signing in again."
             ),
             "sub": sub,
