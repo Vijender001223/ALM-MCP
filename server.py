@@ -1224,6 +1224,35 @@ async def whoami(ctx: Context) -> Any:
     return role_info
 
 
+@mcp.tool()
+async def logout(ctx: Context) -> Any:
+    """
+    Clears the current session's identity (set via login_with_adobe() or
+    set_my_identity()), so subsequent calls behave as if nobody has
+    signed in yet — write tools will require login_with_adobe() again,
+    and read tools revert to the default-open behavior for an unknown
+    identity.
+
+    This only clears identity — it does NOT affect the active
+    environment (see set_environment), any manual access_token override
+    (see set_access_token), or the learner-scoped token (see
+    set_learner_access_token). Those are separate, independent pieces of
+    session state and aren't considered part of "being logged in."
+
+    Useful for testing role-based behavior under multiple identities in
+    one sitting (e.g. confirming a Learner-only account is blocked, then
+    logging out and back in as Admin), or simply to stop being
+    identified as yourself for the rest of the session.
+    """
+    state = _get_session_state(ctx)
+    was_signed_in = bool(state["identity"]["email"])
+    previous_email = state["identity"]["email"]
+    state["identity"] = {"email": None, "email_verified": None, "verified_at": 0, "sub": None}
+    return {
+        "status": "logged_out",
+        "was_signed_in_as": previous_email if was_signed_in else None,
+    }
+
 
 @mcp.tool()
 async def set_access_token(ctx: Context, new_token: str) -> Any:
