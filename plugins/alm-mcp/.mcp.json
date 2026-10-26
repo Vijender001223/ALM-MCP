@@ -1,8 +1,22 @@
 {
-  "mcpServers": {
-    "adobe-learning-manager": {
-      "type": "http",
-      "url": "https://alm-mcp.onrender.com/mcp"
+  "auth_providers": [
+    {
+      "name": "alm-mcp-auth",
+      "passthrough": {
+        "headers": {
+          "authorization": "authorization"
+        }
+      }
     }
+  ],
+  "mcp_servers": {
+    "servers": [
+      {
+        "name": "alm",
+        "source": "https://alm-mcp.onrender.com/mcp",
+        "transport": "streamable_http",
+        "auth": "alm-mcp-auth"
+      }
+    ]
   }
 }
