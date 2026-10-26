@@ -1,0 +1,17 @@
+{
+  "name": "alm-marketplace",
+  "owner": {
+    "name": "ALM MCP"
+  },
+  "metadata": {
+    "description": "Adobe Learning Manager tools for Adobe Coworker"
+  },
+  "plugins": [
+    {
+      "name": "alm-mcp",
+      "source": "./plugins/alm-mcp",
+      "description": "Connect Adobe Coworker to the Render-hosted Adobe Learning Manager MCP server",
+      "version": "1.0.0"
+    }
+  ]
+}

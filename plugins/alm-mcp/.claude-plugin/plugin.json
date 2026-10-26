@@ -1,0 +1,8 @@
+{
+  "name": "alm-mcp",
+  "version": "1.0.0",
+  "description": "Adobe Learning Manager MCP integration for Adobe Coworker",
+  "author": {
+    "name": "ALM MCP"
+  }
+}
